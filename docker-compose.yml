@@ -1,0 +1,254 @@
+services:
+  # ============================================================
+  # WEB - Django Application
+  # ============================================================
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lms_web
+    command: gunicorn lms.wsgi:application --bind 0.0.0.0:8000 --workers 4 --timeout 120
+    volumes:
+      - .:/app
+      - media_data:/app/media
+      - static_data:/app/staticfiles
+    ports:
+      - "8000:8000"
+    environment:
+      - DJANGO_SETTINGS_MODULE=lms.settings.base
+      - SECRET_KEY=${SECRET_KEY:-django-insecure-dev-key-change-in-production}
+      - DEBUG=${DEBUG:-True}
+      - POSTGRES_DB=${POSTGRES_DB:-lms_db}
+      - POSTGRES_USER=${POSTGRES_USER:-lms_user}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-lms_password}
+      - POSTGRES_HOST=db
+      - REDIS_HOST=redis
+      - MONGODB_HOST=mongodb
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_USER=${RABBITMQ_USER:-lms_user}
+      - RABBITMQ_PASS=${RABBITMQ_PASS:-lms_password}
+      - RABBITMQ_VHOST=${RABBITMQ_VHOST:-lms_vhost}
+      - EMAIL_HOST=${EMAIL_HOST:-smtp.gmail.com}
+      - EMAIL_HOST_USER=${EMAIL_HOST_USER:-}
+      - EMAIL_HOST_PASSWORD=${EMAIL_HOST_PASSWORD:-}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - lms_network
+    restart: unless-stopped
+
+  # ============================================================
+  # DB - PostgreSQL
+  # ============================================================
+  db:
+    image: postgres:15-alpine
+    container_name: lms_postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_DB=lms_db
+      - POSTGRES_USER=lms_user
+      - POSTGRES_PASSWORD=lms_password
+    ports:
+      - "5432:5432"
+    networks:
+      - lms_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lms_user -d lms_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ============================================================
+  # REDIS - Caching & Result Backend
+  # ============================================================
+  redis:
+    image: redis:7-alpine
+    container_name: lms_redis
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - lms_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ============================================================
+  # MONGODB - Activity Logs & Analytics
+  # ============================================================
+  mongodb:
+    image: mongo:7.0
+    container_name: lms_mongodb
+    volumes:
+      - mongodb_data:/data/db
+    environment:
+      - MONGO_INITDB_DATABASE=lms_analytics
+    ports:
+      - "27017:27017"
+    networks:
+      - lms_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')", "--quiet"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+
+  # ============================================================
+  # RABBITMQ - Message Broker
+  # ============================================================
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    container_name: lms_rabbitmq
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    environment:
+      - RABBITMQ_DEFAULT_USER=lms_user
+      - RABBITMQ_DEFAULT_PASS=lms_password
+      - RABBITMQ_DEFAULT_VHOST=lms_vhost
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    networks:
+      - lms_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+
+  # ============================================================
+  # CELERY WORKER - Task Processing
+  # ============================================================
+  celery-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lms_celery_worker
+    command: celery -A lms.celery worker --loglevel=info --concurrency=4
+    volumes:
+      - .:/app
+      - media_data:/app/media
+    environment:
+      - DJANGO_SETTINGS_MODULE=lms.settings.base
+      - SECRET_KEY=${SECRET_KEY:-django-insecure-dev-key-change-in-production}
+      - POSTGRES_HOST=db
+      - POSTGRES_DB=lms_db
+      - POSTGRES_USER=lms_user
+      - POSTGRES_PASSWORD=lms_password
+      - REDIS_HOST=redis
+      - MONGODB_HOST=mongodb
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_USER=lms_user
+      - RABBITMQ_PASS=lms_password
+      - RABBITMQ_VHOST=lms_vhost
+      - EMAIL_HOST_USER=${EMAIL_HOST_USER:-}
+      - EMAIL_HOST_PASSWORD=${EMAIL_HOST_PASSWORD:-}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - lms_network
+    restart: unless-stopped
+
+  # ============================================================
+  # CELERY BEAT - Scheduler
+  # ============================================================
+  celery-beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lms_celery_beat
+    command: celery -A lms.celery beat --loglevel=info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    volumes:
+      - .:/app
+    environment:
+      - DJANGO_SETTINGS_MODULE=lms.settings.base
+      - SECRET_KEY=${SECRET_KEY:-django-insecure-dev-key-change-in-production}
+      - POSTGRES_HOST=db
+      - POSTGRES_DB=lms_db
+      - POSTGRES_USER=lms_user
+      - POSTGRES_PASSWORD=lms_password
+      - REDIS_HOST=redis
+      - MONGODB_HOST=mongodb
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_USER=lms_user
+      - RABBITMQ_PASS=lms_password
+      - RABBITMQ_VHOST=lms_vhost
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - lms_network
+    restart: unless-stopped
+
+  # ============================================================
+  # FLOWER - Celery Monitoring
+  # ============================================================
+  flower:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lms_flower
+    command: celery -A lms.celery flower --port=5555
+    ports:
+      - "5555:5555"
+    environment:
+      - DJANGO_SETTINGS_MODULE=lms.settings.base
+      - SECRET_KEY=${SECRET_KEY:-django-insecure-dev-key-change-in-production}
+      - REDIS_HOST=redis
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_USER=lms_user
+      - RABBITMQ_PASS=lms_password
+      - RABBITMQ_VHOST=lms_vhost
+    depends_on:
+      - rabbitmq
+      - redis
+    networks:
+      - lms_network
+    restart: unless-stopped
+
+# ============================================================
+# VOLUMES
+# ============================================================
+volumes:
+  postgres_data:
+  redis_data:
+  mongodb_data:
+  rabbitmq_data:
+  media_data:
+  static_data:
+
+# ============================================================
+# NETWORKS
+# ============================================================
+networks:
+  lms_network:
+    driver: bridge
